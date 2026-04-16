@@ -16,18 +16,16 @@ dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
 bus_pt  = dbus.SystemBus()
 bus_lin = dbus.SystemBus()
 
-PAN_TILT     = "/org/bluez/hci1/dev_D8_A0_1D_59_2D_05"
-LINEAR       = "/org/bluez/hci1/dev_D8_A0_1D_64_1B_E5"
-ADAPTER      = "/org/bluez/hci1"
-ADAPTER_MAC  = "10:5A:95:63:39:23"
-ADAPTER_HCI  = "hci1"
+PAN_TILT     = "/org/bluez/hci0/dev_D8_A0_1D_59_2D_05"
+LINEAR       = "/org/bluez/hci0/dev_D8_A0_1D_64_1B_E5"
+ADAPTER      = "/org/bluez/hci0"
+ADAPTER_MAC  = "88:A2:9E:B2:05:B0"
+ADAPTER_HCI  = "hci0"
 PAN_TILT_MAC = "D8:A0:1D:59:2D:05"
 LINEAR_MAC   = "D8:A0:1D:64:1B:E5"
 KEEPALIVE_CMD           = bytes.fromhex("00042805000000")
-KEEPALIVE_SUPPRESS_SECS = 0.3
+KEEPALIVE_INTERVAL_SECS = 0.18
 CMD_CHAR                = "/service0028/char002c"
-
-last_frame_sent = {PAN_TILT: 0.0, LINEAR: 0.0}
 
 # ================================================================
 # State
@@ -97,13 +95,7 @@ def wait_for_adapter(timeout=15):
 
 def reset_adapter():
     subprocess.run(["sudo", "hciconfig", ADAPTER_HCI, "down"], check=False)
-    time.sleep(1)
-    for mac in [PAN_TILT_MAC, LINEAR_MAC]:
-        subprocess.run(["sudo", "rm", "-f",
-            f"/var/lib/bluetooth/{ADAPTER_MAC}/cache/{mac}"], check=False)
-        subprocess.run(["sudo", "rm", "-f",
-            f"/var/lib/bluetooth/{ADAPTER_MAC}/{mac}/attributes"], check=False)
-    time.sleep(1)
+    time.sleep(2)
     subprocess.run(["sudo", "hciconfig", ADAPTER_HCI, "up"], check=False)
     time.sleep(5)
     deadline = time.time() + 15
@@ -178,14 +170,6 @@ def connect_with_retry(bus, device_path, name, device_mac, attempts=5):
             return True
     return False
 
-def reconnect_if_needed(bus, device_path, name, device_mac):
-    if is_connected(bus, device_path):
-        return True
-    success = connect_with_retry(bus, device_path, name, device_mac)
-    if success:
-        time.sleep(1)
-    return success
-
 def disconnect_all():
     for bus, path in [(bus_pt, PAN_TILT), (bus_lin, LINEAR)]:
         try:
@@ -203,17 +187,15 @@ def send_frame(frame):
     def send_pt():
         try:
             write_char(bus_pt, PAN_TILT, CMD_CHAR, command)
-            last_frame_sent[PAN_TILT] = time.time()
             results['pt'] = True
-        except:
+        except Exception as e:
             results['pt'] = False
 
     def send_lin():
         try:
             write_char(bus_lin, LINEAR, CMD_CHAR, command)
-            last_frame_sent[LINEAR] = time.time()
             results['lin'] = True
-        except:
+        except Exception as e:
             results['lin'] = False
 
     threads = [threading.Thread(target=send_pt),
@@ -224,31 +206,44 @@ def send_frame(frame):
         t.join()
     return results
 
-def wait_and_keepalive(deadline):
-    while True:
-        remaining = deadline - time.time()
-        if remaining <= 0.05:
-            break
-        now = time.time()
-        for bus, dev_path in ((bus_pt, PAN_TILT), (bus_lin, LINEAR)):
-            if now - last_frame_sent[dev_path] < KEEPALIVE_SUPPRESS_SECS:
-                continue
-            def _write(b=bus, p=dev_path):
+# ================================================================
+# Keepalive thread — single thread, runs for duration of sequence
+# Sends keepalive to both devices every KEEPALIVE_INTERVAL_SECS.
+# Pauses naturally when stop_event is set.
+# ================================================================
+
+keepalive_active = threading.Event()
+
+def keepalive_loop():
+    while not stop_event.is_set():
+        if keepalive_active.is_set():
+            for bus, path in ((bus_pt, PAN_TILT), (bus_lin, LINEAR)):
                 try:
-                    write_char(b, p, CMD_CHAR, KEEPALIVE_CMD)
+                    write_char(bus, path, CMD_CHAR, KEEPALIVE_CMD)
                 except:
                     pass
-            threading.Thread(target=_write, daemon=True).start()
-        remaining = deadline - time.time()
-        time.sleep(min(0.18, max(0, remaining - 0.02)))
+        time.sleep(KEEPALIVE_INTERVAL_SECS)
 
-def return_to_start():
-    return_cmd = bytes.fromhex("000c28170000020000000001000000")
-    for bus, path in [(bus_pt, PAN_TILT), (bus_lin, LINEAR)]:
-        try:
-            write_char(bus, path, CMD_CHAR, return_cmd)
-        except:
-            pass
+def wait_interval(deadline):
+    """Wait until deadline, updating display each second. No keepalive here —
+    the keepalive_loop thread handles that independently."""
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        if stop_event.is_set():
+            break
+        if not pause_event.is_set():
+            # Paused — wait here until resumed
+            while not pause_event.is_set():
+                if stop_event.is_set():
+                    return
+                time.sleep(0.1)
+            # Reset deadline after resume
+            deadline = time.time() + cfg_interval
+        secs_left = max(0, int(deadline - time.time()))
+        display.show_progress(current_frame, cfg_frames, cfg_interval, secs_left)
+        time.sleep(0.5)
 
 # ================================================================
 # Sequence thread
@@ -256,6 +251,9 @@ def return_to_start():
 
 def run_sequence():
     global state, current_frame
+
+    keepalive_active.set()
+
     try:
         while not stop_event.is_set():
             current_frame += 1
@@ -266,32 +264,27 @@ def run_sequence():
                     "Returning to start",
                     "Please wait..."
                 )
+                keepalive_active.clear()
                 return_to_start()
                 time.sleep(3)
                 set_state(State.MAIN_MENU)
                 return
 
-            reconnect_if_needed(
-                bus_pt, PAN_TILT, "Pan/Tilt", PAN_TILT_MAC)
-            reconnect_if_needed(
-                bus_lin, LINEAR, "Linear", LINEAR_MAC)
+            # Check connections — reconnect silently if dropped
+            for bus, path, name, mac in [
+                (bus_pt, PAN_TILT, "Pan/Tilt", PAN_TILT_MAC),
+                (bus_lin, LINEAR,  "Linear",   LINEAR_MAC)
+            ]:
+                if not is_connected(bus, path):
+                    keepalive_active.clear()
+                    display.show_message(
+                        "Reconnecting...", name, "", "Please wait...")
+                    connect_with_retry(bus, path, name, mac)
+                    keepalive_active.set()
 
             send_frame(current_frame)
             frame_deadline = time.time() + cfg_interval
-
-            while time.time() < frame_deadline:
-                if stop_event.is_set():
-                    break
-                if not pause_event.is_set():
-                    while not pause_event.is_set():
-                        if stop_event.is_set():
-                            break
-                        time.sleep(0.1)
-                    frame_deadline = time.time() + cfg_interval
-                secs_left = max(0, int(frame_deadline - time.time()))
-                display.show_progress(
-                    current_frame, cfg_frames, cfg_interval, secs_left)
-                wait_and_keepalive(min(frame_deadline, time.time() + 0.2))
+            wait_interval(frame_deadline)
 
         display.show_message(
             "Stopped",
@@ -299,11 +292,13 @@ def run_sequence():
             "Returning to start",
             "Please wait..."
         )
+        keepalive_active.clear()
         return_to_start()
         time.sleep(3)
         set_state(State.MAIN_MENU)
 
     except Exception as e:
+        keepalive_active.clear()
         display.show_message(
             "Error!",
             str(e)[:20],
@@ -313,6 +308,14 @@ def run_sequence():
         print(f"run_sequence exception: {e}")
         traceback.print_exc()
         set_state(State.MAIN_MENU)
+
+def return_to_start():
+    return_cmd = bytes.fromhex("000c28170000020000000001000000")
+    for bus, path in [(bus_pt, PAN_TILT), (bus_lin, LINEAR)]:
+        try:
+            write_char(bus, path, CMD_CHAR, return_cmd)
+        except:
+            pass
 
 # ================================================================
 # Menu rendering
@@ -358,7 +361,8 @@ def render():
 # State transitions
 # ================================================================
 
-sequence_thread = None
+sequence_thread  = None
+keepalive_thread = None
 
 def set_state(new_state):
     global state, menu_index
@@ -369,13 +373,16 @@ def set_state(new_state):
 def do_return_and_restart():
     global current_frame
     set_state(State.RESTARTING)
+    keepalive_active.clear()
     return_to_start()
     time.sleep(3)
     current_frame = 0
     do_run()
 
 def do_run():
-    global sequence_thread, stop_event, pause_event, current_frame, ble_ready
+    global sequence_thread, keepalive_thread, stop_event, pause_event
+    global current_frame, ble_ready
+
     if ble_ready:
         if not is_connected(bus_pt, PAN_TILT) or \
            not is_connected(bus_lin, LINEAR):
@@ -385,12 +392,21 @@ def do_run():
             ble_ready = False
             threading.Thread(target=ble_connect, daemon=True).start()
             return
+
     current_frame = 0
-    stop_event  = threading.Event()
-    pause_event = threading.Event()
+    stop_event    = threading.Event()
+    pause_event   = threading.Event()
     pause_event.set()
+    keepalive_active.clear()
+
     set_state(State.RUNNING)
-    sequence_thread = threading.Thread(target=run_sequence, daemon=True)
+
+    keepalive_thread = threading.Thread(
+        target=keepalive_loop, daemon=True)
+    keepalive_thread.start()
+
+    sequence_thread = threading.Thread(
+        target=run_sequence, daemon=True)
     sequence_thread.start()
 
 def ble_connect():
@@ -515,9 +531,10 @@ def on_button(btn, step=1):
 
 def cleanup(signum=None, frame=None):
     display.show_message("Shutting down...", "", "", "")
+    stop_event.set()
+    pause_event.set()
+    keepalive_active.clear()
     if sequence_thread and sequence_thread.is_alive():
-        stop_event.set()
-        pause_event.set()
         sequence_thread.join(timeout=5)
     disconnect_all()
     display.clear()
