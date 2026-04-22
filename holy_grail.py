@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
 Holy Grail Timelapse Controller
-Integrates Syrp BLE motion control with gphoto2 camera control
-and automatic exposure ramping for dawn/dusk timelapses.
+GPIO shutter trigger + gphoto2 EXIF read + Syrp BLE motion control
 """
 
 import threading
@@ -16,13 +15,23 @@ import os
 
 import dbus
 import dbus.mainloop.glib
+import RPi.GPIO as GPIO
 
 from lcd_display import Display
 from buttons import ButtonHandler
 
 dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
-
 bus = dbus.SystemBus()
+
+# ================================================================
+# Hardware config
+# ================================================================
+
+SHUTTER_PIN = 5      # BCM GPIO 5 = pin 29
+SHUTTER_MS  = 200    # shutter pulse duration in ms
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(SHUTTER_PIN, GPIO.OUT, initial=GPIO.LOW)
 
 # ================================================================
 # BLE Device config
@@ -43,24 +52,24 @@ CMD_CHAR                = "/service0028/char002c"
 # Camera config
 # ================================================================
 
-JPEG_PATH   = "/tmp/hg_frame.jpg"
-GPHOTO2_CMD = ["gphoto2", "--capture-image-and-download", "--keep",
-               "--filename", JPEG_PATH, "--force-overwrite"]
+JPEG_PATH    = "/tmp/hg_frame.jpg"
+CARD_FOLDER  = None   # detected at startup
+LAST_FILE_N  = None   # last known file number on card
 
 # ================================================================
-# Session config (user settable via menu)
+# Session config
 # ================================================================
 
-cfg_frames        = 200       # total frames
-cfg_rest          = 5         # fixed rest after shutter closes (secs)
-cfg_wobble        = 0.5       # stabilisation delay after BLE move (secs)
-cfg_max_tv        = 20.0      # max shutter speed before ISO rises (secs)
-cfg_max_iso       = 6400      # ISO ceiling
-cfg_ev_threshold  = 0.33      # EV drift before correction applied
-cfg_drift_ev      = -1.5      # total creative EV drift over session (neg=D->N)
-cfg_direction     = 'D->N'    # 'D->N' or 'N->D'
+cfg_frames        = 200
+cfg_rest          = 5
+cfg_wobble        = 0.5
+cfg_max_tv        = 20.0
+cfg_max_iso       = 6400
+cfg_ev_threshold  = 0.33
+cfg_drift_ev      = -1.5
+cfg_direction     = 'D->N'
 
-# Shutter speed steps — standard 1/3 stop ladder (seconds)
+# Shutter speed steps — 1/3 stop ladder (seconds)
 TV_STEPS = [
     1/8000, 1/6400, 1/5000, 1/4000, 1/3200, 1/2500, 1/2000,
     1/1600, 1/1250, 1/1000, 1/800,  1/640,  1/500,  1/400,
@@ -72,7 +81,6 @@ TV_STEPS = [
     10.0,   13.0,   15.0,   20.0,   25.0,   30.0
 ]
 
-# ISO steps — standard 1/3 stop ladder
 ISO_STEPS = [64, 80, 100, 125, 160, 200, 250, 320, 400, 500,
              640, 800, 1000, 1250, 1600, 2000, 2500, 3200,
              4000, 5000, 6400, 8000, 10000, 12800]
@@ -93,7 +101,6 @@ class State:
     EDIT_DIR      = 'edit_dir'
     RUNNING       = 'running'
     PAUSED        = 'paused'
-    RESTARTING    = 'restarting'
 
 state         = State.MAIN_MENU
 menu_index    = 0
@@ -103,13 +110,166 @@ pause_event   = threading.Event()
 stop_event    = threading.Event()
 pause_event.set()
 
-# Exposure state (set from first frame EXIF)
-base_tv       = None
-base_iso      = None
-current_tv    = None
-current_iso   = None
+base_tv     = None
+base_iso    = None
+current_tv  = None
+current_iso = None
 
 display = Display()
+
+# ================================================================
+# Camera helpers
+# ================================================================
+
+def fire_shutter():
+    """Fire shutter via GPIO pulse."""
+    GPIO.output(SHUTTER_PIN, GPIO.HIGH)
+    time.sleep(SHUTTER_MS / 1000)
+    GPIO.output(SHUTTER_PIN, GPIO.LOW)
+    print("fire_shutter: fired", flush=True)
+
+def detect_card_folder():
+    """Find the most recent DCIM folder on the camera card."""
+    global CARD_FOLDER
+    r = subprocess.run(["gphoto2", "--list-folders"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"detect_card_folder failed: {r.stderr.strip()}", flush=True)
+        return False
+    folders = [l.strip().lstrip('- ') for l in r.stdout.split('\n')
+               if 'NCZ_8' in l or 'NZ_8' in l or 'DCIM' in l.upper() and 'NCZ' in l]
+    # Pick the last (highest numbered) folder
+    dcim_folders = [f for f in folders if f]
+    if not dcim_folders:
+        # Try any folder with files
+        all_folders = [l.strip().lstrip('- ') for l in r.stdout.split('\n')
+                      if l.strip().startswith('-')]
+        dcim_folders = [f for f in all_folders if 'DCIM' not in f
+                       and 'store' not in f and f]
+    if dcim_folders:
+        CARD_FOLDER = '/store_00020001/DCIM/' + sorted(dcim_folders)[-1]
+        print(f"detect_card_folder: using {CARD_FOLDER}", flush=True)
+        return True
+    print(f"detect_card_folder: no folder found in: {r.stdout}", flush=True)
+    return False
+
+def get_last_file_number():
+    """Get the count of files in the current card folder."""
+    r = subprocess.run(
+        ["gphoto2", "--list-files", "--folder", CARD_FOLDER],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    lines = [l for l in r.stdout.split('\n') if l.strip().startswith('#')]
+    if not lines:
+        return None
+    # Return the highest file number
+    try:
+        return int(lines[-1].split()[0].lstrip('#'))
+    except:
+        return None
+
+def download_last_jpeg():
+    """Download the most recently added JPEG from the card."""
+    global LAST_FILE_N
+
+    # List files to find the new one
+    r = subprocess.run(
+        ["gphoto2", "--list-files", "--folder", CARD_FOLDER],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"list-files failed: {r.stderr.strip()}", flush=True)
+        return False
+
+    lines = [l.strip() for l in r.stdout.split('\n') if l.strip().startswith('#')]
+
+    # Find JPEG files newer than LAST_FILE_N
+    new_jpegs = []
+    for line in lines:
+        parts = line.split()
+        try:
+            n = int(parts[0].lstrip('#'))
+            name = parts[1]
+            if n > (LAST_FILE_N or 0) and name.upper().endswith('.JPG'):
+                new_jpegs.append((n, name))
+        except:
+            continue
+
+    if not new_jpegs:
+        # No new JPEG — try downloading the last JPEG we can find
+        all_jpegs = []
+        for line in lines:
+            parts = line.split()
+            try:
+                n = int(parts[0].lstrip('#'))
+                name = parts[1]
+                if name.upper().endswith('.JPG'):
+                    all_jpegs.append((n, name))
+            except:
+                continue
+        if all_jpegs:
+            new_jpegs = [all_jpegs[-1]]
+        else:
+            print("download_last_jpeg: no JPEG found", flush=True)
+            return False
+
+    # Download the first new JPEG
+    file_n, file_name = new_jpegs[0]
+    if os.path.exists(JPEG_PATH):
+        os.remove(JPEG_PATH)
+
+    r = subprocess.run(
+        ["gphoto2", "--get-file", str(file_n),
+         "--folder", CARD_FOLDER,
+         "--filename", JPEG_PATH, "--force-overwrite"],
+        capture_output=True, text=True)
+
+    if r.returncode != 0 or not os.path.exists(JPEG_PATH):
+        print(f"download failed: {r.stderr.strip()}", flush=True)
+        return False
+
+    LAST_FILE_N = file_n
+    print(f"download_last_jpeg: got {file_name} (#{file_n})", flush=True)
+    return True
+
+def read_exif():
+    """Read exposure EXIF from downloaded JPEG.
+    Returns (ev_diff, tv_secs, iso) or None."""
+    r = subprocess.run(
+        ["exiftool", "-ExposureDifference", "-ExposureTime", "-ISO",
+         "-csv", JPEG_PATH],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"exiftool failed: {r.stderr.strip()}", flush=True)
+        return None
+    try:
+        lines = r.stdout.strip().split('\n')
+        data  = lines[1].split(',')
+        ev_diff = float(data[1])
+        tv_str  = data[2].strip()
+        if '/' in tv_str:
+            num, den = tv_str.split('/')
+            tv = float(num) / float(den)
+        else:
+            tv = float(tv_str)
+        iso = int(float(data[3]))
+        return ev_diff, tv, iso
+    except Exception as e:
+        print(f"exiftool parse error: {e}", flush=True)
+        return None
+
+def set_camera_exposure(tv, iso):
+    """Set shutter speed and ISO on Z8 via gphoto2."""
+    if tv >= 1.0:
+        tv_str = f"{tv:.6g}"
+    else:
+        tv_str = f"1/{int(round(1/tv))}"
+    for config, val in [("shutterspeed", tv_str), ("iso", str(iso))]:
+        r = subprocess.run(
+            ["gphoto2", "--set-config", f"{config}={val}"],
+            capture_output=True, text=True)
+        if r.returncode != 0:
+            print(f"set {config}={val} failed: {r.stderr.strip()}", flush=True)
 
 # ================================================================
 # Exposure helpers
@@ -120,8 +280,7 @@ def tv_to_str(tv_secs):
         return "?"
     if tv_secs >= 1.0:
         return f"{tv_secs:.1f}s"
-    else:
-        return f"1/{int(round(1/tv_secs))}"
+    return f"1/{int(round(1/tv_secs))}"
 
 def nearest_tv(tv_secs):
     return min(TV_STEPS, key=lambda x: abs(x - tv_secs))
@@ -136,141 +295,62 @@ def iso_index(iso):
     return ISO_STEPS.index(nearest_iso(iso))
 
 def s_curve(x):
-    """S-curve mapping 0..1 -> 0..1, slow-fast-slow."""
     return (math.tanh((x - 0.5) * 4) + math.tanh(2)) / (2 * math.tanh(2))
 
 def creative_drift_ev(frame, total_frames):
-    """Returns the cumulative creative EV offset for this frame."""
     if total_frames <= 1:
         return 0.0
     t = (frame - 1) / (total_frames - 1)
-    curve = s_curve(t)
-    drift = cfg_drift_ev * curve
-    if cfg_direction == 'N->D':
-        drift = -drift
-    return drift
+    drift = cfg_drift_ev * s_curve(t)
+    return -drift if cfg_direction == 'N->D' else drift
 
 def apply_exposure_correction(tv, iso, correction_ev):
-    """
-    Apply correction_ev stops of exposure change.
-    Positive = more exposure. Adjust Tv first, spill into ISO.
-    Returns (new_tv, new_iso, actual_ev_applied).
-    """
-    max_tv_allowed  = min(cfg_max_tv, max(TV_STEPS))
-    max_iso_allowed = min(cfg_max_iso, max(ISO_STEPS))
-
     ti = tv_index(tv)
     ii = iso_index(iso)
-    stops_remaining = correction_ev
+    stops = correction_ev
     actual = 0.0
+    max_tv  = min(cfg_max_tv, max(TV_STEPS))
+    max_iso = min(cfg_max_iso, max(ISO_STEPS))
 
-    # Adjust Tv first
-    while abs(stops_remaining) >= 0.16:
-        if stops_remaining > 0:
-            if ti < len(TV_STEPS) - 1 and TV_STEPS[ti + 1] <= max_tv_allowed:
-                ti += 1
-                stops_remaining -= 1/3
-                actual += 1/3
-            else:
-                break
+    while abs(stops) >= 0.16:
+        if stops > 0:
+            if ti < len(TV_STEPS)-1 and TV_STEPS[ti+1] <= max_tv:
+                ti += 1; stops -= 1/3; actual += 1/3
+            else: break
         else:
             if ti > 0:
-                ti -= 1
-                stops_remaining += 1/3
-                actual -= 1/3
-            else:
-                break
+                ti -= 1; stops += 1/3; actual -= 1/3
+            else: break
 
-    # Spill into ISO
-    while abs(stops_remaining) >= 0.16:
-        if stops_remaining > 0:
-            if ii < len(ISO_STEPS) - 1 and ISO_STEPS[ii + 1] <= max_iso_allowed:
-                ii += 1
-                stops_remaining -= 1/3
-                actual += 1/3
-            else:
-                break
+    while abs(stops) >= 0.16:
+        if stops > 0:
+            if ii < len(ISO_STEPS)-1 and ISO_STEPS[ii+1] <= max_iso:
+                ii += 1; stops -= 1/3; actual += 1/3
+            else: break
         else:
             if ii > 0:
-                ii -= 1
-                stops_remaining += 1/3
-                actual -= 1/3
-            else:
-                break
+                ii -= 1; stops += 1/3; actual -= 1/3
+            else: break
 
     return TV_STEPS[ti], ISO_STEPS[ii], actual
-
-def set_camera_exposure(tv, iso):
-    """Set shutter speed and ISO on Z8 via gphoto2."""
-    if tv >= 1.0:
-        tv_str = f"{tv:.6g}"
-    else:
-        denom = int(round(1/tv))
-        tv_str = f"1/{denom}"
-
-    for config, val in [("shutterspeed", tv_str), ("iso", str(iso))]:
-        r = subprocess.run(
-            ["gphoto2", "--set-config", f"{config}={val}"],
-            capture_output=True, text=True)
-        if r.returncode != 0:
-            print(f"set_camera_exposure {config}={val} failed: {r.stderr.strip()}", flush=True)
-
-def capture_and_read_exif():
-    """Fire shutter, download JPEG, read EXIF.
-    Returns (ev_diff, tv_secs, iso) or None on failure."""
-    if os.path.exists(JPEG_PATH):
-        os.remove(JPEG_PATH)
-
-    r = subprocess.run(GPHOTO2_CMD, capture_output=True, text=True)
-    if r.returncode != 0:
-        print(f"capture failed: {r.stderr.strip()}", flush=True)
-        return None
-
-    if not os.path.exists(JPEG_PATH):
-        print("capture: no file downloaded", flush=True)
-        return None
-
-    r = subprocess.run(
-        ["exiftool", "-ExposureDifference", "-ExposureTime", "-ISO",
-         "-csv", JPEG_PATH],
-        capture_output=True, text=True)
-
-    if r.returncode != 0:
-        print(f"exiftool failed: {r.stderr.strip()}", flush=True)
-        return None
-
-    try:
-        lines = r.stdout.strip().split('\n')
-        data  = lines[1].split(',')
-        ev_diff = float(data[1])
-        tv_str  = data[2].strip()
-        if '/' in tv_str:
-            num, den = tv_str.split('/')
-            tv = float(num) / float(den)
-        else:
-            tv = float(tv_str)
-        iso = int(float(data[3]))
-        return ev_diff, tv, iso
-    except Exception as e:
-        print(f"exiftool parse error: {e} raw: {r.stdout}", flush=True)
-        return None
 
 # ================================================================
 # BLE helpers
 # ================================================================
 
+att_lock = threading.Lock()
+
 def get_char(device_path, char_path):
     return dbus.Interface(
         bus.get_object("org.bluez", device_path + char_path),
-        "org.bluez.GattCharacteristic1"
-    )
+        "org.bluez.GattCharacteristic1")
 
 def write_char(device_path, char_path, data):
-    char = get_char(device_path, char_path)
-    char.WriteValue(
-        dbus.Array([dbus.Byte(b) for b in data], signature='y'),
-        dbus.Dictionary({"type": dbus.String("request")}, signature='sv')
-    )
+    with att_lock:
+        char = get_char(device_path, char_path)
+        char.WriteValue(
+            dbus.Array([dbus.Byte(b) for b in data], signature='y'),
+            dbus.Dictionary({"type": dbus.String("request")}, signature='sv'))
 
 def start_notify(device_path, char_path):
     try:
@@ -286,24 +366,26 @@ def is_connected(device_path):
     except:
         return False
 
-def reset_adapter():
-    subprocess.run(["sudo", "hciconfig", ADAPTER_HCI, "down"], check=False)
-    time.sleep(2)
-    subprocess.run(["sudo", "hciconfig", ADAPTER_HCI, "up"], check=False)
-    time.sleep(5)
-    deadline = time.time() + 15
+def wait_for_adapter(timeout=15):
+    deadline = time.time() + timeout
     while time.time() < deadline:
         try:
             props = dbus.Interface(
                 bus.get_object("org.bluez", ADAPTER),
-                "org.freedesktop.DBus.Properties"
-            )
+                "org.freedesktop.DBus.Properties")
             if props.Get("org.bluez.Adapter1", "Powered"):
                 return True
         except:
             pass
         time.sleep(0.5)
     return False
+
+def reset_adapter():
+    subprocess.run(["sudo", "hciconfig", ADAPTER_HCI, "down"], check=False)
+    time.sleep(2)
+    subprocess.run(["sudo", "hciconfig", ADAPTER_HCI, "up"], check=False)
+    time.sleep(5)
+    return wait_for_adapter()
 
 def scan_until_found(device_mac, timeout=15):
     adapter = dbus.Interface(bus.get_object("org.bluez", ADAPTER),
@@ -399,10 +481,17 @@ def keepalive_loop():
     while not stop_event.is_set():
         if keepalive_active.is_set():
             for path in (PAN_TILT, LINEAR):
-                try:
-                    write_char(path, CMD_CHAR, KEEPALIVE_CMD)
-                except:
-                    pass
+                if att_lock.acquire(blocking=False):
+                    try:
+                        get_char(path, CMD_CHAR).WriteValue(
+                            dbus.Array([dbus.Byte(b) for b in KEEPALIVE_CMD],
+                                       signature='y'),
+                            dbus.Dictionary(
+                                {"type": dbus.String("request")}, signature='sv'))
+                    except:
+                        pass
+                    finally:
+                        att_lock.release()
         time.sleep(KEEPALIVE_INTERVAL_SECS)
 
 def return_to_start():
@@ -449,39 +538,51 @@ def run_sequence():
             # Step 1: BLE frame advance
             send_frame(current_frame)
 
-            # Step 2: Wobble delay — let camera settle after move
+            # Step 2: Wobble delay
             time.sleep(cfg_wobble)
 
-            # Step 3: Fire shutter and read EXIF
+            # Step 3: Fire shutter via GPIO
             display.show_message(
                 f"Frame {current_frame}/{cfg_frames}",
                 f"Tv:{tv_to_str(current_tv)}  ISO:{current_iso or '?'}",
                 "Capturing...", "")
+            fire_shutter()
 
-            result = capture_and_read_exif()
+            # Step 4: Wait for exposure to complete + card write buffer
+            tv_wait = (current_tv or 1/400) + 1.5
+            time.sleep(tv_wait)
+
+            # Step 5: Download last JPEG and read EXIF
+            display.show_message(
+                f"Frame {current_frame}/{cfg_frames}",
+                f"Tv:{tv_to_str(current_tv)}  ISO:{current_iso or '?'}",
+                "Reading EXIF...", "")
+
+            if download_last_jpeg():
+                result = read_exif()
+            else:
+                result = None
 
             if result is None:
-                print(f"Frame {current_frame}: capture failed, skipping", flush=True)
+                print(f"Frame {current_frame}: EXIF failed, skipping correction",
+                      flush=True)
             else:
                 ev_diff, exif_tv, exif_iso = result
                 print(f"Frame {current_frame}: ev_diff={ev_diff:+.2f} "
                       f"tv={tv_to_str(exif_tv)} iso={exif_iso}", flush=True)
 
-                # Lock base exposure from first successful frame
                 if base_tv is None:
                     base_tv     = exif_tv
                     base_iso    = exif_iso
                     current_tv  = exif_tv
                     current_iso = exif_iso
-                    print(f"Base locked: Tv={tv_to_str(base_tv)} ISO={base_iso}", flush=True)
+                    print(f"Base locked: Tv={tv_to_str(base_tv)} ISO={base_iso}",
+                          flush=True)
 
-                # Scene correction: push ev_diff back toward zero
-                # ev_diff negative = scene darker than metered = need more exposure
                 scene_correction = 0.0
                 if abs(ev_diff) >= cfg_ev_threshold:
                     scene_correction = -ev_diff
 
-                # Creative drift step for this frame
                 drift_step = 0.0
                 if current_frame > 1:
                     drift_step = (creative_drift_ev(current_frame, cfg_frames) -
@@ -498,12 +599,11 @@ def run_sequence():
                         print(f"Frame {current_frame}: "
                               f"scene={scene_correction:+.2f} "
                               f"drift={drift_step:+.2f} "
-                              f"total={total_correction:+.2f} "
                               f"-> Tv={tv_to_str(current_tv)} ISO={current_iso}",
                               flush=True)
                         set_camera_exposure(current_tv, current_iso)
 
-            # Step 4: Fixed rest interval
+            # Step 6: Fixed rest interval
             rest_deadline = time.time() + cfg_rest
             while time.time() < rest_deadline:
                 if stop_event.is_set():
@@ -515,15 +615,14 @@ def run_sequence():
                         time.sleep(0.1)
                     rest_deadline = time.time() + cfg_rest
                 secs_left = max(0, int(rest_deadline - time.time()))
-                cumulative_drift = creative_drift_ev(current_frame, cfg_frames)
+                drift = creative_drift_ev(current_frame, cfg_frames)
                 display.show_message(
                     f"Frame {current_frame}/{cfg_frames}",
                     f"Tv:{tv_to_str(current_tv)}  ISO:{current_iso or '?'}",
-                    f"Drift:{cumulative_drift:+.2f}EV",
+                    f"Drift:{drift:+.2f}EV",
                     f"Rest: {secs_left}s")
                 time.sleep(0.5)
 
-        # Stopped by user
         display.show_message("Stopped",
             f"Frame {current_frame}/{cfg_frames}",
             "Returning to start", "Please wait...")
@@ -549,7 +648,6 @@ def render():
         if ble_ready:
             items.append("Disconnect")
         display.show_menu("Holy Grail", items, menu_index)
-
     elif state == State.SETUP:
         display.show_menu("Setup", [
             f"Frames:   {cfg_frames:>5}",
@@ -561,7 +659,6 @@ def render():
             f"Dir:    {cfg_direction}",
             "< Back"
         ], menu_index)
-
     elif state == State.EDIT_FRAMES:
         display.show_edit("Setup", "Frames", cfg_frames, "frames")
     elif state == State.EDIT_REST:
@@ -576,15 +673,10 @@ def render():
         display.show_edit("Setup", "Creative drift", cfg_drift_ev, "EV")
     elif state == State.EDIT_DIR:
         display.show_menu("Direction", ["D->N", "N->D"], menu_index)
-
     elif state == State.PAUSED:
         display.show_menu(
             f"PAUSED {current_frame}/{cfg_frames}",
             ["Resume", "Stop"], menu_index)
-
-    elif state == State.RESTARTING:
-        display.show_message("Restarting...",
-            "Returning to start", "Please wait...", "")
 
 # ================================================================
 # State machine
@@ -610,6 +702,20 @@ def do_run():
             threading.Thread(target=ble_connect, daemon=True).start()
             return
 
+    # Detect camera card folder
+    display.show_message("Checking camera...", "Finding card folder", "", "")
+    if not detect_card_folder():
+        display.show_message("Camera error",
+            "Check USB connection", "", "")
+        time.sleep(3)
+        set_state(State.MAIN_MENU)
+        return
+
+    # Record current file count so we know what's new after each shot
+    global LAST_FILE_N
+    LAST_FILE_N = get_last_file_number()
+    print(f"do_run: card folder={CARD_FOLDER} last_file={LAST_FILE_N}", flush=True)
+
     current_frame = 0
     base_tv       = None
     base_iso      = None
@@ -630,12 +736,13 @@ def do_run():
 
 def ble_connect():
     global ble_ready
-    display.show_message("Connecting...", "Resetting adapter", "Please wait...", "")
-    if not reset_adapter():
-        display.show_message("Error", "Adapter not found", "", "")
-        time.sleep(3)
-        set_state(State.MAIN_MENU)
-        return
+    display.show_message("Connecting...", "Please wait...", "", "")
+    if not wait_for_adapter():
+        if not reset_adapter():
+            display.show_message("Error", "Adapter not found", "", "")
+            time.sleep(3)
+            set_state(State.MAIN_MENU)
+            return
     display.show_message("Connecting...", "Pan/Tilt...", "", "")
     if not connect_with_retry(PAN_TILT, "Pan/Tilt", PAN_TILT_MAC):
         display.show_message("Error", "Pan/Tilt failed", "", "")
@@ -719,8 +826,8 @@ def on_button(btn, step=1):
     elif state == State.EDIT_MAX_TV:
         tv_vals = [1, 2, 4, 6, 8, 10, 15, 20, 25, 30]
         idx = min(range(len(tv_vals)), key=lambda i: abs(tv_vals[i] - cfg_max_tv))
-        if btn == 'up':     idx = min(len(tv_vals) - 1, idx + 1)
-        elif btn == 'down': idx = max(0, idx - 1)
+        if btn == 'up':     idx = min(len(tv_vals)-1, idx+1)
+        elif btn == 'down': idx = max(0, idx-1)
         cfg_max_tv = tv_vals[idx]
         if btn in ('centre', 'left'): set_state(State.SETUP)
         render()
@@ -728,8 +835,8 @@ def on_button(btn, step=1):
     elif state == State.EDIT_MAX_ISO:
         iso_vals = [400, 800, 1600, 3200, 6400, 12800]
         idx = min(range(len(iso_vals)), key=lambda i: abs(iso_vals[i] - cfg_max_iso))
-        if btn == 'up':     idx = min(len(iso_vals) - 1, idx + 1)
-        elif btn == 'down': idx = max(0, idx - 1)
+        if btn == 'up':     idx = min(len(iso_vals)-1, idx+1)
+        elif btn == 'down': idx = max(0, idx-1)
         cfg_max_iso = iso_vals[idx]
         if btn in ('centre', 'left'): set_state(State.SETUP)
         render()
@@ -770,6 +877,8 @@ def on_button(btn, step=1):
 
 def cleanup(signum=None, frame=None):
     display.show_message("Shutting down...", "", "", "")
+    GPIO.output(SHUTTER_PIN, GPIO.LOW)
+    GPIO.cleanup()
     stop_event.set()
     pause_event.set()
     keepalive_active.clear()
