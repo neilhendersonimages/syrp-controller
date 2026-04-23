@@ -2,7 +2,11 @@
 """
 Holy Grail Timelapse Controller
 GPIO shutter trigger + gphoto2 EXIF read + Syrp BLE motion control
-BLE architecture copied verbatim from stable syrp_controller.py
+
+Frame timing:
+  total wall time = wobble + Tv + rest + overhead
+  cfg_interval = wobble + rest + overhead (Tv is additional)
+  rest = whatever remains of cfg_interval after wobble + overhead
 """
 
 import threading
@@ -32,10 +36,11 @@ SHUTTER_PIN = 5
 SHUTTER_MS  = 200
 
 GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
 GPIO.setup(SHUTTER_PIN, GPIO.OUT, initial=GPIO.LOW)
 
 # ================================================================
-# BLE config — identical to syrp_controller.py
+# BLE config
 # ================================================================
 
 PAN_TILT     = "/org/bluez/hci0/dev_D8_A0_1D_59_2D_05"
@@ -64,7 +69,7 @@ LAST_FILE_N = None
 # ================================================================
 
 cfg_frames        = 200
-cfg_rest          = 5
+cfg_interval      = 5      # target interval excl. Tv (secs)
 cfg_wobble        = 0.5
 cfg_max_tv        = 20.0
 cfg_max_iso       = 6400
@@ -95,7 +100,7 @@ class State:
     MAIN_MENU    = 'main_menu'
     SETUP        = 'setup'
     EDIT_FRAMES  = 'edit_frames'
-    EDIT_REST    = 'edit_rest'
+    EDIT_INT     = 'edit_interval'
     EDIT_WOBBLE  = 'edit_wobble'
     EDIT_MAX_TV  = 'edit_max_tv'
     EDIT_MAX_ISO = 'edit_max_iso'
@@ -120,21 +125,19 @@ current_iso = None
 display = Display()
 
 # ================================================================
-# BLE helpers — copied verbatim from syrp_controller.py
+# BLE helpers — verbatim from syrp_controller.py
 # ================================================================
 
 def get_char(bus, device_path, char_path):
     return dbus.Interface(
         bus.get_object("org.bluez", device_path + char_path),
-        "org.bluez.GattCharacteristic1"
-    )
+        "org.bluez.GattCharacteristic1")
 
 def write_char(bus, device_path, char_path, data):
     char = get_char(bus, device_path, char_path)
     char.WriteValue(
         dbus.Array([dbus.Byte(b) for b in data], signature='y'),
-        dbus.Dictionary({"type": dbus.String("request")}, signature='sv')
-    )
+        dbus.Dictionary({"type": dbus.String("request")}, signature='sv'))
 
 def start_notify(bus, device_path, char_path):
     try:
@@ -170,8 +173,7 @@ def reset_adapter():
         try:
             props = dbus.Interface(
                 bus.get_object("org.bluez", ADAPTER),
-                "org.freedesktop.DBus.Properties"
-            )
+                "org.freedesktop.DBus.Properties")
             if props.Get("org.bluez.Adapter1", "Powered"):
                 return True
         except:
@@ -280,8 +282,7 @@ def send_frame(frame):
     return results
 
 def wait_and_keepalive(deadline):
-    """Wait until deadline, sending keepalives on the same thread.
-    This is the key to stability — no separate keepalive thread."""
+    """Wait until deadline sending keepalives on same thread."""
     while True:
         remaining = deadline - time.time()
         if remaining <= 0.05:
@@ -318,9 +319,8 @@ def fire_shutter():
 def detect_card_folder():
     global CARD_FOLDER
     r = subprocess.run(["gphoto2", "--list-folders"],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, timeout=15)
     if r.returncode != 0:
-        print(f"detect_card_folder failed: {r.stderr.strip()}", flush=True)
         return False
     folders = []
     for line in r.stdout.split('\n'):
@@ -330,89 +330,95 @@ def detect_card_folder():
             if 'NCZ_8' in name or 'NZ_8' in name:
                 folders.append(name)
     if not folders:
-        print(f"No DCIM folders found", flush=True)
         return False
     CARD_FOLDER = '/store_00020001/DCIM/' + sorted(folders)[-1]
-    print(f"detect_card_folder: using {CARD_FOLDER}", flush=True)
+    print(f"card folder: {CARD_FOLDER}", flush=True)
     return True
 
 def get_last_file_number():
-    r = subprocess.run(
-        ["gphoto2", "--list-files", "--folder", CARD_FOLDER],
-        capture_output=True, text=True)
-    if r.returncode != 0:
-        return None
-    lines = [l for l in r.stdout.split('\n') if l.strip().startswith('#')]
-    if not lines:
-        return None
     try:
+        r = subprocess.run(
+            ["gphoto2", "--list-files", "--folder", CARD_FOLDER],
+            capture_output=True, text=True, timeout=15)
+        if r.returncode != 0:
+            return None
+        lines = [l for l in r.stdout.split('\n') if l.strip().startswith('#')]
+        if not lines:
+            return None
         return int(lines[-1].split()[0].lstrip('#'))
     except:
         return None
 
 def download_last_jpeg():
+    """Download the next new JPEG from the card."""
     global LAST_FILE_N
-    r = subprocess.run(
-        ["gphoto2", "--list-files", "--folder", CARD_FOLDER],
-        capture_output=True, text=True)
-    if r.returncode != 0:
-        print(f"list-files failed: {r.stderr.strip()}", flush=True)
-        return False
-    lines = [l.strip() for l in r.stdout.split('\n')
-             if l.strip().startswith('#')]
-    new_jpegs = []
-    for line in lines:
-        parts = line.split()
-        try:
-            n    = int(parts[0].lstrip('#'))
-            name = parts[1]
-            if n > (LAST_FILE_N or 0) and name.upper().endswith('.JPG'):
-                new_jpegs.append((n, name))
-        except:
-            continue
-    if not new_jpegs:
-        all_jpegs = []
+    try:
+        r = subprocess.run(
+            ["gphoto2", "--list-files", "--folder", CARD_FOLDER],
+            capture_output=True, text=True, timeout=15)
+        if r.returncode != 0:
+            print(f"list-files failed: {r.stderr.strip()}", flush=True)
+            return False
+
+        lines = [l.strip() for l in r.stdout.split('\n')
+                 if l.strip().startswith('#')]
+        new_jpegs = []
         for line in lines:
             parts = line.split()
             try:
                 n    = int(parts[0].lstrip('#'))
                 name = parts[1]
-                if name.upper().endswith('.JPG'):
-                    all_jpegs.append((n, name))
+                if n > (LAST_FILE_N or 0) and name.upper().endswith('.JPG'):
+                    new_jpegs.append((n, name))
             except:
                 continue
-        if all_jpegs:
-            new_jpegs = [all_jpegs[-1]]
-        else:
-            print("download_last_jpeg: no JPEG found", flush=True)
+
+        if not new_jpegs:
+            # Fall back to last JPEG on card
+            all_jpegs = [(int(l.split()[0].lstrip('#')), l.split()[1])
+                         for l in lines
+                         if l.split()[1].upper().endswith('.JPG')
+                         if len(l.split()) > 1]
+            if all_jpegs:
+                new_jpegs = [all_jpegs[-1]]
+            else:
+                print("no JPEG found on card", flush=True)
+                return False
+
+        file_n, file_name = new_jpegs[0]
+        if os.path.exists(JPEG_PATH):
+            os.remove(JPEG_PATH)
+
+        r = subprocess.run(
+            ["gphoto2", "--get-file", str(file_n),
+             "--folder", CARD_FOLDER,
+             "--filename", JPEG_PATH, "--force-overwrite"],
+            capture_output=True, text=True, timeout=20)
+
+        if r.returncode != 0 or not os.path.exists(JPEG_PATH):
+            print(f"download failed: {r.stderr.strip()}", flush=True)
             return False
 
-    file_n, file_name = new_jpegs[0]
-    if os.path.exists(JPEG_PATH):
-        os.remove(JPEG_PATH)
+        LAST_FILE_N = file_n
+        print(f"downloaded {file_name} (#{file_n})", flush=True)
+        return True
 
-    r = subprocess.run(
-        ["gphoto2", "--get-file", str(file_n),
-         "--folder", CARD_FOLDER,
-         "--filename", JPEG_PATH, "--force-overwrite"],
-        capture_output=True, text=True)
-
-    if r.returncode != 0 or not os.path.exists(JPEG_PATH):
-        print(f"download failed: {r.stderr.strip()}", flush=True)
+    except subprocess.TimeoutExpired:
+        print("download_last_jpeg: timeout", flush=True)
+        return False
+    except Exception as e:
+        print(f"download_last_jpeg error: {e}", flush=True)
         return False
 
-    LAST_FILE_N = file_n
-    print(f"download_last_jpeg: got {file_name} (#{file_n})", flush=True)
-    return True
-
 def read_exif():
-    r = subprocess.run(
-        ["exiftool", "-ExposureDifference", "-ExposureTime", "-ISO",
-         "-csv", JPEG_PATH],
-        capture_output=True, text=True)
-    if r.returncode != 0:
-        return None
+    """Read exposure EXIF from downloaded JPEG."""
     try:
+        r = subprocess.run(
+            ["exiftool", "-ExposureDifference", "-ExposureTime", "-ISO",
+             "-csv", JPEG_PATH],
+            capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            return None
         lines = r.stdout.strip().split('\n')
         data  = lines[1].split(',')
         ev_diff = float(data[1])
@@ -424,8 +430,11 @@ def read_exif():
             tv = float(tv_str)
         iso = int(float(data[3]))
         return ev_diff, tv, iso
+    except subprocess.TimeoutExpired:
+        print("read_exif: timeout", flush=True)
+        return None
     except Exception as e:
-        print(f"exiftool parse error: {e}", flush=True)
+        print(f"read_exif error: {e}", flush=True)
         return None
 
 def set_camera_exposure(tv, iso):
@@ -434,11 +443,14 @@ def set_camera_exposure(tv, iso):
     else:
         tv_str = f"1/{int(round(1/tv))}"
     for config, val in [("shutterspeed", tv_str), ("iso", str(iso))]:
-        r = subprocess.run(
-            ["gphoto2", "--set-config", f"{config}={val}"],
-            capture_output=True, text=True)
-        if r.returncode != 0:
-            print(f"set {config}={val} failed: {r.stderr.strip()}", flush=True)
+        try:
+            r = subprocess.run(
+                ["gphoto2", "--set-config", f"{config}={val}"],
+                capture_output=True, text=True, timeout=10)
+            if r.returncode != 0:
+                print(f"set {config} failed: {r.stderr.strip()}", flush=True)
+        except subprocess.TimeoutExpired:
+            print(f"set {config}: timeout", flush=True)
 
 # ================================================================
 # Exposure helpers
@@ -522,32 +534,34 @@ def run_sequence():
                 set_state(State.MAIN_MENU)
                 return
 
-            # Step 1: Reconnect if needed
+            # Reconnect if needed
             reconnect_if_needed(bus, PAN_TILT, "Pan/Tilt", PAN_TILT_MAC)
             reconnect_if_needed(bus, LINEAR,   "Linear",   LINEAR_MAC)
 
-            # Step 2: BLE frame advance
+            # Step 1: BLE frame advance
             send_frame(current_frame)
 
-            # Step 3: Wobble delay — keepalive runs here
-            wobble_deadline = time.time() + cfg_wobble
-            wait_and_keepalive(wobble_deadline)
+            # Step 2: Wobble — keepalive runs here
+            wait_and_keepalive(time.time() + cfg_wobble)
 
-            # Step 4: Fire shutter via GPIO
+            # Step 3: Start interval timer NOW — everything from here
+            # (shutter + Tv wait + download + EXIF + set exposure + rest)
+            # must fit within cfg_interval. Tv is on top of this.
+            interval_end = time.time() + cfg_interval
+
+            # Step 4: Fire shutter
             display.show_message(
                 f"Frame {current_frame}/{cfg_frames}",
                 f"Tv:{tv_to_str(current_tv)}  ISO:{current_iso or '?'}",
                 "Capturing...", "")
             fire_shutter()
 
-            # Step 5: Wait for exposure + card write
-            # Keepalive runs during this wait too
+            # Step 5: Wait for exposure to complete + card write buffer
+            # Keepalive runs during this wait
             tv_wait = (current_tv or 1/400) + 1.5
             wait_and_keepalive(time.time() + tv_wait)
 
-            # Step 6: Download JPEG and read EXIF
-            # Keepalive pauses here — gphoto2 needs the USB bus
-            # We send a burst first to tide the devices over
+            # Step 6: Download JPEG — send keepalive burst first
             for _ in range(3):
                 for path in (PAN_TILT, LINEAR):
                     try:
@@ -555,18 +569,13 @@ def run_sequence():
                     except:
                         pass
                 time.sleep(0.05)
-
-            display.show_message(
-                f"Frame {current_frame}/{cfg_frames}",
-                f"Tv:{tv_to_str(current_tv)}  ISO:{current_iso or '?'}",
-                "Reading EXIF...", "")
 
             if download_last_jpeg():
                 result = read_exif()
             else:
                 result = None
 
-            # Send another burst after download
+            # Step 7: Send keepalive burst after download
             for _ in range(3):
                 for path in (PAN_TILT, LINEAR):
                     try:
@@ -575,8 +584,9 @@ def run_sequence():
                         pass
                 time.sleep(0.05)
 
+            # Step 8: Process EXIF and update exposure
             if result is None:
-                print(f"Frame {current_frame}: EXIF failed", flush=True)
+                print(f"Frame {current_frame}: no EXIF", flush=True)
             else:
                 ev_diff, exif_tv, exif_iso = result
                 print(f"Frame {current_frame}: ev_diff={ev_diff:+.2f} "
@@ -613,9 +623,12 @@ def run_sequence():
                               flush=True)
                         set_camera_exposure(current_tv, current_iso)
 
-            # Step 7: Fixed rest interval with keepalive
-            rest_deadline = time.time() + cfg_rest
-            while time.time() < rest_deadline:
+            # Step 9: Rest — wait out remainder of interval
+            # Display countdown, keepalive runs throughout
+            while True:
+                remaining = interval_end - time.time()
+                if remaining <= 0.05:
+                    break
                 if stop_event.is_set():
                     break
                 if not pause_event.is_set():
@@ -623,15 +636,16 @@ def run_sequence():
                         if stop_event.is_set():
                             break
                         time.sleep(0.1)
-                    rest_deadline = time.time() + cfg_rest
-                secs_left = max(0, int(rest_deadline - time.time()))
+                    # Reset interval on resume
+                    interval_end = time.time() + cfg_interval
+                secs_left = max(0, int(interval_end - time.time()))
                 drift = creative_drift_ev(current_frame, cfg_frames)
                 display.show_message(
                     f"Frame {current_frame}/{cfg_frames}",
                     f"Tv:{tv_to_str(current_tv)}  ISO:{current_iso or '?'}",
                     f"Drift:{drift:+.2f}EV",
-                    f"Rest: {secs_left}s")
-                wait_and_keepalive(min(rest_deadline, time.time() + 0.5))
+                    f"Next: {secs_left}s")
+                wait_and_keepalive(min(interval_end, time.time() + 0.5))
 
         display.show_message("Stopped",
             f"Frame {current_frame}/{cfg_frames}",
@@ -659,7 +673,7 @@ def render():
     elif state == State.SETUP:
         display.show_menu("Setup", [
             f"Frames:   {cfg_frames:>5}",
-            f"Rest:     {cfg_rest:>4}s",
+            f"Interval: {cfg_interval:>4}s",
             f"Wobble:   {cfg_wobble:>4}s",
             f"Max Tv:   {cfg_max_tv:>4}s",
             f"Max ISO:{cfg_max_iso:>6}",
@@ -669,8 +683,8 @@ def render():
         ], menu_index)
     elif state == State.EDIT_FRAMES:
         display.show_edit("Setup", "Frames", cfg_frames, "frames")
-    elif state == State.EDIT_REST:
-        display.show_edit("Setup", "Rest interval", cfg_rest, "secs")
+    elif state == State.EDIT_INT:
+        display.show_edit("Setup", "Interval", cfg_interval, "secs")
     elif state == State.EDIT_WOBBLE:
         display.show_edit("Setup", "Wobble time", cfg_wobble, "secs")
     elif state == State.EDIT_MAX_TV:
@@ -718,7 +732,7 @@ def do_run():
         return
 
     LAST_FILE_N = get_last_file_number()
-    print(f"do_run: folder={CARD_FOLDER} last_file={LAST_FILE_N}", flush=True)
+    print(f"card: {CARD_FOLDER} last_file={LAST_FILE_N}", flush=True)
 
     current_frame = 0
     base_tv       = None
@@ -764,7 +778,7 @@ def ble_connect():
 
 def on_button(btn, step=1):
     global state, menu_index, ble_ready
-    global cfg_frames, cfg_rest, cfg_wobble, cfg_max_tv
+    global cfg_frames, cfg_interval, cfg_wobble, cfg_max_tv
     global cfg_max_iso, cfg_drift_ev, cfg_direction
 
     if state == State.MAIN_MENU:
@@ -795,7 +809,7 @@ def on_button(btn, step=1):
         elif btn == 'down':
             menu_index = min(7, menu_index + 1)
         elif btn == 'centre':
-            targets = [State.EDIT_FRAMES, State.EDIT_REST, State.EDIT_WOBBLE,
+            targets = [State.EDIT_FRAMES, State.EDIT_INT, State.EDIT_WOBBLE,
                        State.EDIT_MAX_TV, State.EDIT_MAX_ISO, State.EDIT_DRIFT,
                        State.EDIT_DIR, State.MAIN_MENU]
             set_state(targets[menu_index])
@@ -809,9 +823,9 @@ def on_button(btn, step=1):
         elif btn in ('centre', 'left'): set_state(State.SETUP)
         render()
 
-    elif state == State.EDIT_REST:
-        if btn == 'up':     cfg_rest += 1
-        elif btn == 'down': cfg_rest = max(1, cfg_rest - 1)
+    elif state == State.EDIT_INT:
+        if btn == 'up':     cfg_interval += 1
+        elif btn == 'down': cfg_interval = max(1, cfg_interval - 1)
         elif btn in ('centre', 'left'): set_state(State.SETUP)
         render()
 
